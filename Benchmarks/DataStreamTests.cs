@@ -70,7 +70,7 @@ public struct Data
 
 public interface IStreamHandler
 {
-    event Action<Data[]> OnUpdate;
+    event Action<ReadOnlySpan<Data>> OnUpdate;
     int Handle(ReadOnlySpan<Data> items);
 }
 
@@ -79,25 +79,31 @@ public sealed class LockStreamHandler : IStreamHandler
     private readonly Lock _locker = new();
     private long _lastUpdateId;
 
-    public event Action<Data[]>? OnUpdate;
+    public event Action<ReadOnlySpan<Data>>? OnUpdate;
 
     public int Handle(ReadOnlySpan<Data> items)
     {
         lock (_locker)
         {
-            if (_lastUpdateId <= items[^1].Id)
+            if (items[^1].Id <= _lastUpdateId)
             {
                 return 0;
             }
 
+            var skipCount = 0;
+            while (skipCount < items.Length && items[skipCount].Id <= _lastUpdateId)
+            {
+                skipCount++;
+            }
+
             _lastUpdateId = items[^1].Id;
-            OnUpdate?.Invoke(items.ToArray());
+            OnUpdate?.Invoke(items[skipCount..]);
             return items.Length;
         }
     }
 }
 
-public class ChannelStreamHandler : IStreamHandler
+public class ChannelStreamHandler : IStreamHandler, IDisposable
 {
     // 1. Создаем структуру для индекса с отступами (Padding)
     // 64 байта (размер кэш-линии) = 8 байт (long value) + 56 байт (отступ)
@@ -110,14 +116,18 @@ public class ChannelStreamHandler : IStreamHandler
     private readonly Data[] _buffer;
     private readonly int _mask;
     private readonly int _capacity;
+    private readonly int _readBatchSize;
 
     private CacheLineAlignedCounter _writeCounter;
     private CacheLineAlignedCounter _readCounter;
     private CacheLineAlignedCounter _updateIdCounter;
 
-    public event Action<Data[]>? OnUpdate;
+    private readonly Thread _workerThread;
+    private volatile bool _isRunning = true;
 
-    public ChannelStreamHandler(int capacity)
+    public event Action<ReadOnlySpan<Data>>? OnUpdate;
+
+    public ChannelStreamHandler(int capacity, int readBatchSize = 128)
     {
         if ((capacity & (capacity - 1)) != 0)
         {
@@ -125,12 +135,22 @@ public class ChannelStreamHandler : IStreamHandler
         }
 
         _buffer = new Data[capacity];
-        _capacity = capacity;
         _mask = capacity - 1;
+        _capacity = capacity;
+        _readBatchSize = readBatchSize;
 
         _writeCounter = default;
         _readCounter = default;
         _updateIdCounter = default;
+
+        _workerThread = new Thread(ReaderLoop)
+        {
+            IsBackground = true,
+            Name = "RingBuffer-Hot-Reader",
+            Priority = ThreadPriority.Highest,
+        };
+
+        _workerThread.Start();
     }
 
     public int Handle(ReadOnlySpan<Data> items)
@@ -259,5 +279,32 @@ public class ChannelStreamHandler : IStreamHandler
 
             return actualToRead;
         }
+    }
+
+    private void ReaderLoop()
+    {
+        Span<Data> items = stackalloc Data[_readBatchSize];
+
+        var spinner = new SpinWait();
+
+        while (_isRunning)
+        {
+            var readCount = TryReadBatch(items);
+            if (readCount > 0)
+            {
+                spinner.Reset();
+                OnUpdate?.Invoke(items[..readCount]);
+            }
+            else
+            {
+                spinner.SpinOnce();
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        _isRunning = false;
+        _workerThread.Join();
     }
 }
