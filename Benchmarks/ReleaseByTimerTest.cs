@@ -3,7 +3,6 @@ using BenchmarkDotNet.Attributes;
 
 namespace sand_box.Benchmarks;
 
-
 // BenchmarkDotNet v0.15.8, Windows 10 (10.0.19045.6456/22H2/2022Update)
 // AMD Ryzen 7 5700G with Radeon Graphics 3.80GHz, 1 CPU, 16 logical and 8 physical cores
 //     .NET SDK 10.0.302
@@ -51,9 +50,9 @@ public class ReleaseByTimerTest
         }
 
         var factoryFn = () => new List<int>(101);
-        _stack = new TestStack<List<int>>(factoryFn);
-        _queue = new TestQueue<List<int>>(factoryFn, _processorOperations);
-        _local = new TestLocal<List<int>>(factoryFn, _processorOperations);
+        _stack = new TestStack<List<int>>(factoryFn, 1, TimeSpan.FromMilliseconds(1));
+        _queue = new TestQueue<List<int>>(factoryFn, 1024);
+        _local = new TestLocal<List<int>>(factoryFn, 1024);
 
         _processorQueues = new ConcurrentQueue<List<int>>[_processorCount];
         for (var i = 0; i < _processorQueues.Length; i++)
@@ -72,16 +71,21 @@ public class ReleaseByTimerTest
         }
     }
 
-    [Benchmark(Baseline = true)] public long Stack() => Measure(_stack);
-    [Benchmark] public long Queue() => Measure(_queue);
-    [Benchmark] public long Local() => Measure(_local);
+    [Benchmark(Baseline = true)]
+    public long Stack() => Measure(_stack);
+
+    [Benchmark]
+    public long Queue() => Measure(_queue);
+
+    [Benchmark]
+    public long Local() => Measure(_local);
 
     private long Measure(ITestImpl<List<int>> testImpl)
     {
         ArgumentNullException.ThrowIfNull(testImpl);
 
         var tasks = new Task<int>[_processorCount];
-        var barrier = new SpinBarrier(_processorCount + 1);
+        var barrier = new SpinBarrier(_processorCount);
 
         for (var i = 0; i < _processorCount; i++)
         {
@@ -142,8 +146,6 @@ public class ReleaseByTimerTest
             });
         }
 
-        barrier.SignalAndWait();
-
         return Task
             .WhenAll(tasks)
             .ConfigureAwait(false)
@@ -172,6 +174,11 @@ internal class SpinBarrier(int participantCount)
             var spinner = new SpinWait();
             while (Volatile.Read(ref _generation) == initialGeneration)
             {
+                if (spinner.NextSpinWillYield)
+                {
+                    spinner.Reset();
+                }
+
                 spinner.SpinOnce();
             }
         }
@@ -263,41 +270,54 @@ internal class TestQueue<T>(Func<T> factoryFn, int boundedCapacity) : ITestImpl<
 
 internal class TestStack<T> : ITestImpl<T> where T : class
 {
+    private const int MinCapacity = 1;
+
     private readonly Stack<T> _inner = new();
     private readonly Func<T> _factoryFn;
     private readonly Timer _timer;
+    private readonly int _maxTrimSlices;
+    private int _nextTrimSlices;
+    private int _minSize = int.MinValue;
+    private int _maxSize = int.MaxValue;
 
-    public TestStack(Func<T> factoryFn)
+    public TestStack(Func<T> factoryFn, int trimSlices, TimeSpan period)
     {
         _factoryFn = factoryFn;
-        _timer = new Timer(Resize, null, 100, 100);
+        _maxTrimSlices = trimSlices;
+        _nextTrimSlices = trimSlices;
+        _timer = new Timer(Resize, null, period, period);
     }
 
     public T Acquire()
     {
-        lock (_inner)
-        {
-            return _inner.Count == 0 ? _factoryFn() : _inner.Pop();
-        }
+        lock (_inner) return _inner.Count == 0 ? _factoryFn() : _inner.Pop();
     }
 
     public void Release(T item)
     {
-        lock (_inner)
-        {
-            _inner.Push(item);
-        }
+        lock (_inner) _inner.Push(item);
     }
 
     private void Resize(object? state)
     {
+        if (_maxSize < _inner.Count) _maxSize = _inner.Count;
+        if (_minSize > _inner.Count) _minSize = _inner.Count;
+
+        _nextTrimSlices--;
+        if (_nextTrimSlices > 0) return;
+        _nextTrimSlices = _maxTrimSlices;
+
+        var workingSize = _maxSize - _minSize;
+        var needKeep = Math.Max((int)(workingSize * 1.25) + 1, (int)(_minSize * 0.4));
+        if (needKeep < MinCapacity) needKeep = MinCapacity;
+
         lock (_inner)
         {
-            var removed = _inner.Count / 2;
-            while (removed > 0)
+            if (_inner.Count <= needKeep) return;
+
+            while (_inner.Count > needKeep)
             {
-                removed--;
-                _inner.TryPop(out _);
+                _inner.Pop();
             }
         }
     }
