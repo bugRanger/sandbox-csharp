@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using BenchmarkDotNet.Attributes;
 
 namespace sand_box.Benchmarks;
@@ -10,12 +11,13 @@ namespace sand_box.Benchmarks;
 // Job-NPNGVO : .NET 10.0.10 (10.0.10, 10.0.1026.32716), X64 RyuJIT x86-64-v3
 //
 // Force=True  InvocationCount=1  UnrollFactor=1  
-//
-// | Method | Mean      | Error    | StdDev   | Ratio | Gen0      | Completed Work Items | Lock Contentions | Gen1      | Allocated | Alloc Ratio |
-// |------- |----------:|---------:|---------:|------:|----------:|---------------------:|-----------------:|----------:|----------:|------------:|
-// | Stack  | 523.64 ms | 6.199 ms | 5.495 ms |  1.00 | 6000.0000 |              19.0000 |        2475.0000 | 5000.0000 |  58.52 MB |        1.00 |
-// | Queue  | 273.63 ms | 4.764 ms | 4.457 ms |  0.52 |         - |              18.0000 |                - |         - |   5.96 MB |        0.10 |
-// | Local  |  94.81 ms | 1.811 ms | 3.819 ms |  0.18 |         - |              18.0000 |                - |         - |   6.68 MB |        0.11 |
+// | Method | Mean      | Error     | StdDev    | Ratio         | RatioSD | Completed Work Items | Lock Contentions | Gen0      | Gen1      | Gen2      | Allocated | Alloc Ratio |
+// |------- |----------:|----------:|----------:|--------------:|--------:|---------------------:|-----------------:|----------:|----------:|----------:|----------:|------------:|
+// | Stack  | 484.19 ms |  9.539 ms | 13.057 ms |      baseline |         |              20.0000 |        1743.0000 | 8000.0000 | 7000.0000 | 1000.0000 |  63.58 MB |             |
+// | Queue  | 289.73 ms |  5.770 ms |  7.702 ms |  1.67x faster |   0.06x |              19.0000 |                - | 3000.0000 | 2000.0000 |         - |  31.24 MB |  2.04x less |
+// | Local  |  52.59 ms |  6.967 ms | 20.541 ms | 10.76x faster |   4.21x |              17.0000 |                - |         - |         - |         - |   4.32 MB | 14.70x less |
+// | Bag    | 442.36 ms | 13.742 ms | 40.304 ms |  1.10x faster |   0.11x |              22.0000 |       29658.0000 |         - |         - |         - |   5.08 MB | 12.51x less |
+
 
 /// <summary>
 /// Решение проблемы с отслеживанием памяти высвобождаемой в тике таймера.
@@ -34,12 +36,13 @@ public class ReleaseByTimerTest
     private TestStack<List<int>> _stack;
     private TestQueue<List<int>> _queue;
     private TestLocal<List<int>> _local;
+    private TestBag<List<int>> _bag;
     private ConcurrentQueue<List<int>>[] _processorQueues;
     private readonly List<int> _processorFinishedItem = new(0);
     private readonly int _processorCount = Environment.ProcessorCount;
     private readonly int _processorOperations = 100_001;
 
-    public static void Run() => BenchmarkDotNet.Running.BenchmarkRunner.Run<ReleaseByTimerTest>();
+    public static void Run() => BenchmarkDotNet.Running.BenchmarkRunner.Run<ReleaseByTimerTest>(BenchmarkConfig.Default);
 
     [GlobalSetup]
     public void Setup()
@@ -53,6 +56,7 @@ public class ReleaseByTimerTest
         _stack = new TestStack<List<int>>(factoryFn, 1, TimeSpan.FromMilliseconds(1));
         _queue = new TestQueue<List<int>>(factoryFn, 1024);
         _local = new TestLocal<List<int>>(factoryFn, 1024);
+        _bag = new TestBag<List<int>>(factoryFn, 1024);
 
         _processorQueues = new ConcurrentQueue<List<int>>[_processorCount];
         for (var i = 0; i < _processorQueues.Length; i++)
@@ -79,6 +83,9 @@ public class ReleaseByTimerTest
 
     [Benchmark]
     public long Local() => Measure(_local);
+
+    [Benchmark]
+    public long Bag() => Measure(_bag);
 
     private long Measure(ITestImpl<List<int>> testImpl)
     {
@@ -191,80 +198,60 @@ internal interface ITestImpl<T> where T : class
     void Release(T item);
 }
 
-internal class TestLocal<T>(Func<T> factoryFn, int boundedCapacity) : ITestImpl<T> where T : class
+internal class TestBag<T>(Func<T> factoryFn, int boundedCapacity) : ITestImpl<T> where T : class
 {
-    private readonly ThreadLocal<Queue<T>> _local = new(() => new Queue<T>(), false);
-    private readonly ConcurrentQueue<T> _global = new();
-    private int _queueCounter;
-    private int _acquireCounter;
+    private readonly ConcurrentBoundedCollection<T> _queue = new(new ConcurrentBag<T>(), boundedCapacity);
 
     public T Acquire()
     {
-        if (!_local.Value!.TryDequeue(out var item))
-        {
-            if (!_global.TryDequeue(out item))
-            {
-                return factoryFn();
-            }
-        }
-
-        if (Interlocked.Increment(ref _acquireCounter) >= boundedCapacity)
-        {
-            Interlocked.Decrement(ref _acquireCounter);
-        }
-
-        Interlocked.Decrement(ref _queueCounter);
-        return item;
+        return _queue.TryDequeue(out var item) ? item : factoryFn();
     }
 
     public void Release(T item)
     {
-        if (Interlocked.Decrement(ref _acquireCounter) < 0)
+        _queue.Enqueue(item);
+    }
+}
+
+internal class TestLocal<T>(Func<T> factoryFn, int boundedCapacity) : ITestImpl<T> where T : class
+{
+    private readonly ThreadLocal<Queue<T>> _local = new(() => new Queue<T>(), false);
+    private readonly ConcurrentBoundedCollection<T> _global = new(new ConcurrentQueue<T>(), boundedCapacity);
+
+    public T Acquire()
+    {
+        if (_local.Value!.TryDequeue(out var item))
         {
-            Interlocked.Increment(ref _acquireCounter);
+            return item;
         }
-        else
+
+        return _global.TryDequeue(out item) ? item : factoryFn();
+    }
+
+    public void Release(T item)
+    {
+        if (_local.Value!.Count < boundedCapacity)
         {
             _local.Value!.Enqueue(item);
             return;
         }
 
-        if (Interlocked.Increment(ref _queueCounter) < boundedCapacity)
-        {
-            _global.Enqueue(item);
-        }
-        else
-        {
-            Interlocked.Decrement(ref _queueCounter);
-        }
+        _global.Enqueue(item);
     }
 }
 
 internal class TestQueue<T>(Func<T> factoryFn, int boundedCapacity) : ITestImpl<T> where T : class
 {
-    private int _count;
-    private readonly ConcurrentQueue<T> _queue = new();
+    private readonly ConcurrentBoundedCollection<T> _boundedCollection = new(new ConcurrentQueue<T>(), boundedCapacity);
 
     public T Acquire()
     {
-        if (!_queue.TryDequeue(out var item))
-        {
-            return factoryFn();
-        }
-
-        Interlocked.Decrement(ref _count);
-        return item;
+        return _boundedCollection.TryDequeue(out var item) ? item : factoryFn();
     }
 
     public void Release(T item)
     {
-        if (Interlocked.Increment(ref _count) >= boundedCapacity)
-        {
-            Interlocked.Decrement(ref _count);
-            return;
-        }
-
-        _queue.Enqueue(item);
+        _boundedCollection.Enqueue(item);
     }
 }
 
@@ -320,5 +307,32 @@ internal class TestStack<T> : ITestImpl<T> where T : class
                 _inner.Pop();
             }
         }
+    }
+}
+
+public class ConcurrentBoundedCollection<T>(IProducerConsumerCollection<T> collection, int boundedCapacity)
+{
+    private int _counter;
+
+    public bool TryDequeue([MaybeNullWhen(false)] out T item)
+    {
+        if (!collection.TryTake(out item))
+        {
+            return false;
+        }
+
+        Interlocked.Decrement(ref _counter);
+        return true;
+    }
+
+    public void Enqueue(T item)
+    {
+        if (Interlocked.Increment(ref _counter) >= boundedCapacity)
+        {
+            Interlocked.Decrement(ref _counter);
+            return;
+        }
+
+        _ = collection.TryAdd(item);
     }
 }
