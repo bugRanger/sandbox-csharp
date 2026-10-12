@@ -18,7 +18,6 @@ namespace sand_box.Benchmarks;
 // | Local  |  52.59 ms |  6.967 ms | 20.541 ms | 10.76x faster |   4.21x |              17.0000 |                - |         - |         - |         - |   4.32 MB | 14.70x less |
 // | Bag    | 442.36 ms | 13.742 ms | 40.304 ms |  1.10x faster |   0.11x |              22.0000 |       29658.0000 |         - |         - |         - |   5.08 MB | 12.51x less |
 
-
 /// <summary>
 /// Решение проблемы с отслеживанием памяти высвобождаемой в тике таймера.
 /// Для избежания потери данных по GC применяется ограничение на кол-во потоков <see cref="ThreadPool.SetMaxThreads"/>,
@@ -34,15 +33,17 @@ namespace sand_box.Benchmarks;
 public class ReleaseByTimerTest
 {
     private TestStack<List<int>> _stack;
+    private TestBag<List<int>> _bag;
     private TestQueue<List<int>> _queue;
     private TestLocal<List<int>> _local;
-    private TestBag<List<int>> _bag;
+    private ConcurrentPool<List<int>> _localV1;
     private ConcurrentQueue<List<int>>[] _processorQueues;
     private readonly List<int> _processorFinishedItem = new(0);
     private readonly int _processorCount = Environment.ProcessorCount;
     private readonly int _processorOperations = 100_001;
 
-    public static void Run() => BenchmarkDotNet.Running.BenchmarkRunner.Run<ReleaseByTimerTest>(BenchmarkConfig.Default);
+    public static void Run() =>
+        BenchmarkDotNet.Running.BenchmarkRunner.Run<ReleaseByTimerTest>(BenchmarkConfig.Default);
 
     [GlobalSetup]
     public void Setup()
@@ -54,9 +55,10 @@ public class ReleaseByTimerTest
 
         var factoryFn = () => new List<int>(101);
         _stack = new TestStack<List<int>>(factoryFn, 1, TimeSpan.FromMilliseconds(1));
+        _bag = new TestBag<List<int>>(factoryFn, 1024);
         _queue = new TestQueue<List<int>>(factoryFn, 1024);
         _local = new TestLocal<List<int>>(factoryFn, 1024);
-        _bag = new TestBag<List<int>>(factoryFn, 1024);
+        _localV1 = new ConcurrentPool<List<int>>(factoryFn, 1024);
 
         _processorQueues = new ConcurrentQueue<List<int>>[_processorCount];
         for (var i = 0; i < _processorQueues.Length; i++)
@@ -79,13 +81,16 @@ public class ReleaseByTimerTest
     public long Stack() => Measure(_stack);
 
     [Benchmark]
+    public long Bag() => Measure(_bag);
+
+    [Benchmark]
     public long Queue() => Measure(_queue);
 
     [Benchmark]
     public long Local() => Measure(_local);
 
     [Benchmark]
-    public long Bag() => Measure(_bag);
+    public long LocalV1() => Measure(_localV1);
 
     private long Measure(ITestImpl<List<int>> testImpl)
     {
@@ -192,9 +197,48 @@ internal class SpinBarrier(int participantCount)
     }
 }
 
+internal class ConcurrentPool<T>(Func<T> factoryFn, int boundedCapacity) : ITestImpl<T> where T : class
+{
+    private readonly ThreadLocal<uint> _acquireCounter = new(() => 0, false);
+    private readonly ThreadLocal<Queue<T>> _local = new(() => new Queue<T>(), false);
+    private readonly ConcurrentBoundedCollection<T> _global = new(new ConcurrentQueue<T>(), boundedCapacity);
+
+    public T Acquire()
+    {
+        if (_acquireCounter.Value < boundedCapacity)
+        {
+            _acquireCounter.Value++;
+        }
+
+        if (_local.Value!.TryDequeue(out var item))
+        {
+            return item;
+        }
+
+        return _global.TryDequeue(out item) ? item : factoryFn();
+    }
+
+    public void Release(T item)
+    {
+        if (_acquireCounter.Value > 0)
+        {
+            _acquireCounter.Value--;
+
+            if (_local.Value!.Count < boundedCapacity)
+            {
+                _local.Value.Enqueue(item);
+                return;
+            }
+        }
+
+        _global.Enqueue(item);
+    }
+}
+
 internal interface ITestImpl<T> where T : class
 {
     T Acquire();
+
     void Release(T item);
 }
 
