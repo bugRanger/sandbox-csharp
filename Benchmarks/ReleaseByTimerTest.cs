@@ -21,7 +21,6 @@ namespace sand_box.Benchmarks;
 // | Local   |   664.5 ms | 34.14 ms | 100.67 ms | 8.04x faster |   1.28x |              31.0000 |                - | 48000.0000 | 47000.0000 | 2000.0000 | 359.83 MB |  1.82x more |
 // | LocalV1 |   655.6 ms | 30.93 ms |  91.21 ms | 8.11x faster |   1.16x |              32.0000 |                - | 56000.0000 | 55000.0000 | 1000.0000 | 429.58 MB |  2.18x more |
 
-
 /// <summary>
 /// Решение проблемы с отслеживанием памяти высвобождаемой в тике таймера.
 /// Для избежания потери данных по GC применяется ограничение на кол-во потоков <see cref="ThreadPool.SetMaxThreads"/>,
@@ -40,7 +39,8 @@ public class ReleaseByTimerTest
     private TestBag<List<int>> _bag;
     private TestQueue<List<int>> _queue;
     private TestLocal<List<int>> _local;
-    private ConcurrentPool<List<int>> _localV1;
+    private TestLocalWithStealOnAcquire<List<int>> _localWithStealOnAcquire;
+    private TestLocalWithStealOnRelease<List<int>> _localWithStealOnRelease;
     private BoundedQueue<List<int>>[] _processorQueues;
     private readonly List<int> _processorFinishedItem = new(0);
     private readonly int _processorCount = Environment.ProcessorCount;
@@ -62,12 +62,13 @@ public class ReleaseByTimerTest
         _bag = new TestBag<List<int>>(factoryFn, 1024);
         _queue = new TestQueue<List<int>>(factoryFn, 1024);
         _local = new TestLocal<List<int>>(factoryFn, 1024);
-        _localV1 = new ConcurrentPool<List<int>>(factoryFn, 1024);
+        _localWithStealOnRelease = new TestLocalWithStealOnRelease<List<int>>(factoryFn, 16, 1024);
+        _localWithStealOnAcquire = new TestLocalWithStealOnAcquire<List<int>>(factoryFn, 16, 1024);
 
         _processorQueues = new BoundedQueue<List<int>>[_processorCount];
         for (var i = 0; i < _processorQueues.Length; i++)
         {
-            _processorQueues[i] = new BoundedQueue<List<int>>(_processorOperations);
+            _processorQueues[i] = new BoundedQueue<List<int>>(_processorOperations + 1);
         }
     }
 
@@ -77,7 +78,7 @@ public class ReleaseByTimerTest
         _processorQueues = new BoundedQueue<List<int>>[_processorCount];
         for (var i = 0; i < _processorQueues.Length; i++)
         {
-            _processorQueues[i] = new BoundedQueue<List<int>>(_processorOperations);
+            _processorQueues[i] = new BoundedQueue<List<int>>(_processorOperations + 1);
         }
     }
 
@@ -94,7 +95,10 @@ public class ReleaseByTimerTest
     public long Local() => Measure(_local);
 
     [Benchmark]
-    public long LocalV1() => Measure(_localV1);
+    public long LocalWithStealOnAcquire() => Measure(_localWithStealOnAcquire);
+
+    [Benchmark]
+    public long LocalWithStealOnRelease() => Measure(_localWithStealOnRelease);
 
     private long Measure(ITestImpl<List<int>> testImpl)
     {
@@ -105,57 +109,52 @@ public class ReleaseByTimerTest
 
         for (var i = 0; i < _processorCount; i++)
         {
-            var dequeueQueue = _processorQueues[i];
-            var enqueueQueue = _processorQueues[_processorQueues.Length - i - 1];
+            var taskPublisher = i % 2 == 0;
+            var taskQueue = _processorQueues[taskPublisher ? i : i - 1];
 
-            tasks[i] = Task.Factory.StartNew(() =>
+            tasks[i] = Task.Run(() =>
             {
                 barrier.SignalAndWait();
 
-                var finished = false;
                 var itemCounter = 0;
-                for (var j = 0; j < _processorOperations; j++)
+
+                if (taskPublisher)
                 {
-                    var item = testImpl.Acquire();
-                    for (var k = 0; k < item.Capacity; k++)
+                    for (var j = 0; j < _processorOperations; j++)
                     {
-                        item.Add(k);
+                        var item = testImpl.Acquire();
+                        for (var k = 0; k < item.Capacity; k++)
+                        {
+                            item.Add(k);
+                        }
+
+                        taskQueue.Enqueue(item);
+                        itemCounter++;
                     }
 
-                    enqueueQueue.Enqueue(item);
+                    taskQueue.Enqueue(_processorFinishedItem);
+                }
+                else
+                {
+                    var finished = false;
 
-                    if (dequeueQueue.TryDequeue(out item))
+                    while (!finished)
                     {
+                        if (!taskQueue.TryDequeue(out var item))
+                        {
+                            continue;
+                        }
+
                         finished = item == _processorFinishedItem;
                         if (finished)
                         {
                             continue;
                         }
 
-                        itemCounter += item.Count;
+                        itemCounter++;
                         item.Clear();
                         testImpl.Release(item);
                     }
-                }
-
-                enqueueQueue.Enqueue(_processorFinishedItem);
-
-                while (!finished)
-                {
-                    if (!dequeueQueue.TryDequeue(out var item))
-                    {
-                        continue;
-                    }
-
-                    finished = item == _processorFinishedItem;
-                    if (finished)
-                    {
-                        continue;
-                    }
-
-                    itemCounter += item.Count;
-                    item.Clear();
-                    testImpl.Release(item);
                 }
 
                 return itemCounter;
@@ -195,10 +194,64 @@ internal class SpinBarrier(int participantCount)
     }
 }
 
-internal class ConcurrentPool<T>(Func<T> factoryFn, int boundedCapacity) : ITestImpl<T> where T : class
+internal class TestLocalWithStealOnAcquire<T>(Func<T> factoryFn, int stealCapacity, int boundedCapacity)
+    : ITestImpl<T> where T : class
 {
     private readonly ThreadLocal<uint> _acquireCounter = new(() => 0, false);
     private readonly ThreadLocal<Queue<T>> _local = new(() => new Queue<T>(), false);
+    private readonly ThreadLocal<List<T>> _steal = new(() => new List<T>(stealCapacity), false);
+    private readonly ConcurrentBoundedCollection<T> _global = new(new ConcurrentQueue<T>(), boundedCapacity);
+
+    public T Acquire()
+    {
+        if (_acquireCounter.Value < boundedCapacity)
+        {
+            _acquireCounter.Value++;
+        }
+
+        if (_local.Value!.TryDequeue(out var item))
+        {
+            return item;
+        }
+
+        if (_global.TryDequeueGroup(_steal.Value!))
+        {
+            _local.Value!.EnsureCapacity(_steal.Value!.Capacity);
+
+            foreach (var stealItem in _steal.Value!)
+            {
+                _local.Value!.Enqueue(stealItem);
+            }
+
+            _steal.Value!.Clear();
+            return _local.Value!.TryDequeue(out item) ? item : factoryFn();
+        }
+
+        return _global.TryDequeue(out item) ? item : factoryFn();
+    }
+
+    public void Release(T item)
+    {
+        if (_acquireCounter.Value > 0)
+        {
+            _acquireCounter.Value--;
+            if (_local.Value!.Count < boundedCapacity)
+            {
+                _local.Value!.Enqueue(item);
+                return;
+            }
+        }
+
+        _global.Enqueue(item);
+    }
+}
+
+internal class TestLocalWithStealOnRelease<T>(Func<T> factoryFn, int stealCapacity, int boundedCapacity)
+    : ITestImpl<T> where T : class
+{
+    private readonly ThreadLocal<uint> _acquireCounter = new(() => 0, false);
+    private readonly ThreadLocal<Queue<T>> _local = new(() => new Queue<T>(), false);
+    private readonly ThreadLocal<List<T>> _steal = new(() => new List<T>(stealCapacity), false);
     private readonly ConcurrentBoundedCollection<T> _global = new(new ConcurrentQueue<T>(), boundedCapacity);
 
     public T Acquire()
@@ -225,6 +278,19 @@ internal class ConcurrentPool<T>(Func<T> factoryFn, int boundedCapacity) : ITest
             if (_local.Value!.Count < boundedCapacity)
             {
                 _local.Value.Enqueue(item);
+                return;
+            }
+
+            if (_global.TryDequeueGroup(_steal.Value!))
+            {
+                _local.Value!.EnsureCapacity(_steal.Value!.Capacity);
+
+                foreach (var stealItem in _steal.Value!)
+                {
+                    _local.Value!.Enqueue(stealItem);
+                }
+
+                _steal.Value!.Clear();
                 return;
             }
         }
@@ -358,12 +424,45 @@ public class ConcurrentBoundedCollection<T>(IProducerConsumerCollection<T> colle
 
     public bool TryDequeue([MaybeNullWhen(false)] out T item)
     {
-        if (!collection.TryTake(out item))
+        if (Interlocked.Decrement(ref _counter) < 0)
+        {
+            Interlocked.Increment(ref _counter);
+        }
+        else
+        {
+            if (collection.TryTake(out item))
+            {
+                return true;
+            }
+        }
+
+        item = default;
+        return false;
+    }
+
+    public bool TryDequeueGroup(List<T> items)
+    {
+        if (Volatile.Read(ref _counter) < items.Count)
         {
             return false;
         }
 
-        Interlocked.Decrement(ref _counter);
+        if (Interlocked.Add(ref _counter, -items.Capacity) < 0)
+        {
+            Interlocked.Add(ref _counter, items.Capacity);
+            return false;
+        }
+
+        while (collection.TryTake(out var item))
+        {
+            if (items.Count == items.Capacity)
+            {
+                break;
+            }
+
+            items.Add(item);
+        }
+
         return true;
     }
 
@@ -421,7 +520,7 @@ public class BoundedQueue<T>(int boundedCapacity)
         Volatile.Write(ref _enqueuePos, currentTail + 1);
     }
 
-    public bool TryDequeue(out T? item)
+    public bool TryDequeue([MaybeNullWhen(false)] out T item)
     {
         var currentHead = _dequeuePos;
         var currentTail = Volatile.Read(ref _enqueuePos);
