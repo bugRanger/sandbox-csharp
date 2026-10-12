@@ -1,22 +1,26 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
 using BenchmarkDotNet.Attributes;
 
 namespace sand_box.Benchmarks;
 
 // BenchmarkDotNet v0.15.8, Windows 10 (10.0.19045.6456/22H2/2022Update)
 // AMD Ryzen 7 5700G with Radeon Graphics 3.80GHz, 1 CPU, 16 logical and 8 physical cores
-//     .NET SDK 10.0.302
-//     [Host]     : .NET 10.0.10 (10.0.10, 10.0.1026.32716), X64 RyuJIT x86-64-v3
-// Job-NPNGVO : .NET 10.0.10 (10.0.10, 10.0.1026.32716), X64 RyuJIT x86-64-v3
+// .NET SDK 10.0.302
+//   [Host]     : .NET 10.0.10 (10.0.10, 10.0.1026.32716), X64 RyuJIT x86-64-v3
+//   Job-NPNGVO : .NET 10.0.10 (10.0.10, 10.0.1026.32716), X64 RyuJIT x86-64-v3
 //
 // Force=True  InvocationCount=1  UnrollFactor=1  
-// | Method | Mean      | Error     | StdDev    | Ratio         | RatioSD | Completed Work Items | Lock Contentions | Gen0      | Gen1      | Gen2      | Allocated | Alloc Ratio |
-// |------- |----------:|----------:|----------:|--------------:|--------:|---------------------:|-----------------:|----------:|----------:|----------:|----------:|------------:|
-// | Stack  | 484.19 ms |  9.539 ms | 13.057 ms |      baseline |         |              20.0000 |        1743.0000 | 8000.0000 | 7000.0000 | 1000.0000 |  63.58 MB |             |
-// | Queue  | 289.73 ms |  5.770 ms |  7.702 ms |  1.67x faster |   0.06x |              19.0000 |                - | 3000.0000 | 2000.0000 |         - |  31.24 MB |  2.04x less |
-// | Local  |  52.59 ms |  6.967 ms | 20.541 ms | 10.76x faster |   4.21x |              17.0000 |                - |         - |         - |         - |   4.32 MB | 14.70x less |
-// | Bag    | 442.36 ms | 13.742 ms | 40.304 ms |  1.10x faster |   0.11x |              22.0000 |       29658.0000 |         - |         - |         - |   5.08 MB | 12.51x less |
+//
+// | Method  | Mean       | Error    | StdDev    | Ratio        | RatioSD | Completed Work Items | Lock Contentions | Gen0       | Gen1       | Gen2      | Allocated | Alloc Ratio |
+// |-------- |-----------:|---------:|----------:|-------------:|--------:|---------------------:|-----------------:|-----------:|-----------:|----------:|----------:|------------:|
+// | Stack   | 5,216.2 ms | 42.42 ms |  37.61 ms |     baseline |         |              28.0000 |       20848.0000 | 26000.0000 | 25000.0000 | 1000.0000 | 197.41 MB |             |
+// | Bag     | 4,189.9 ms | 83.56 ms | 158.98 ms | 1.25x faster |   0.05x |              31.0000 |      337638.0000 |  7000.0000 |  6000.0000 | 1000.0000 |  48.48 MB |  4.07x less |
+// | Queue   | 2,941.2 ms | 14.95 ms |  12.49 ms | 1.77x faster |   0.01x |              22.0000 |                - | 19000.0000 | 18000.0000 | 2000.0000 | 134.51 MB |  1.47x less |
+// | Local   |   664.5 ms | 34.14 ms | 100.67 ms | 8.04x faster |   1.28x |              31.0000 |                - | 48000.0000 | 47000.0000 | 2000.0000 | 359.83 MB |  1.82x more |
+// | LocalV1 |   655.6 ms | 30.93 ms |  91.21 ms | 8.11x faster |   1.16x |              32.0000 |                - | 56000.0000 | 55000.0000 | 1000.0000 | 429.58 MB |  2.18x more |
+
 
 /// <summary>
 /// Решение проблемы с отслеживанием памяти высвобождаемой в тике таймера.
@@ -37,10 +41,10 @@ public class ReleaseByTimerTest
     private TestQueue<List<int>> _queue;
     private TestLocal<List<int>> _local;
     private ConcurrentPool<List<int>> _localV1;
-    private ConcurrentQueue<List<int>>[] _processorQueues;
+    private BoundedQueue<List<int>>[] _processorQueues;
     private readonly List<int> _processorFinishedItem = new(0);
     private readonly int _processorCount = Environment.ProcessorCount;
-    private readonly int _processorOperations = 100_001;
+    private readonly int _processorOperations = 1_000_001;
 
     public static void Run() =>
         BenchmarkDotNet.Running.BenchmarkRunner.Run<ReleaseByTimerTest>(BenchmarkConfig.Default);
@@ -60,20 +64,20 @@ public class ReleaseByTimerTest
         _local = new TestLocal<List<int>>(factoryFn, 1024);
         _localV1 = new ConcurrentPool<List<int>>(factoryFn, 1024);
 
-        _processorQueues = new ConcurrentQueue<List<int>>[_processorCount];
+        _processorQueues = new BoundedQueue<List<int>>[_processorCount];
         for (var i = 0; i < _processorQueues.Length; i++)
         {
-            _processorQueues[i] = new ConcurrentQueue<List<int>>();
+            _processorQueues[i] = new BoundedQueue<List<int>>(_processorOperations);
         }
     }
 
     [IterationSetup]
     public void IterationSetup()
     {
-        _processorQueues = new ConcurrentQueue<List<int>>[_processorCount];
+        _processorQueues = new BoundedQueue<List<int>>[_processorCount];
         for (var i = 0; i < _processorQueues.Length; i++)
         {
-            _processorQueues[i] = new ConcurrentQueue<List<int>>();
+            _processorQueues[i] = new BoundedQueue<List<int>>(_processorOperations);
         }
     }
 
@@ -104,7 +108,7 @@ public class ReleaseByTimerTest
             var dequeueQueue = _processorQueues[i];
             var enqueueQueue = _processorQueues[_processorQueues.Length - i - 1];
 
-            tasks[i] = Task.Run(() =>
+            tasks[i] = Task.Factory.StartNew(() =>
             {
                 barrier.SignalAndWait();
 
@@ -183,15 +187,9 @@ internal class SpinBarrier(int participantCount)
         }
         else
         {
-            var spinner = new SpinWait();
             while (Volatile.Read(ref _generation) == initialGeneration)
             {
-                if (spinner.NextSpinWillYield)
-                {
-                    spinner.Reset();
-                }
-
-                spinner.SpinOnce();
+                Thread.SpinWait(10);
             }
         }
     }
@@ -378,5 +376,74 @@ public class ConcurrentBoundedCollection<T>(IProducerConsumerCollection<T> colle
         }
 
         _ = collection.TryAdd(item);
+    }
+}
+
+/// Выравниваем структуру по размеру кэш-линии процессора (64 байта),
+/// чтобы операции записи одного потока не инвалидировали кэш другого.
+[StructLayout(LayoutKind.Sequential)]
+public class BoundedQueue<T>(int boundedCapacity)
+    where T : class
+{
+    // --- КЭШ-ЛИНИЯ 1: Данные конфигурации очереди ---
+    private readonly T?[] _buffer = new T[boundedCapacity];
+
+    // Padding: в 56 байт (7 полей по 8 байт), чтобы отделить конфигурацию от указателя записи.
+    private readonly long _p1, _p2, _p3, _p4, _p5, _p6, _p7;
+
+    // --- КЭШ-ЛИНИЯ 2: Указатель хвоста (Использует только Писатель) ---
+    private long _enqueuePos;
+
+    // Padding: в 56 байт (7 полей по 8 байт), чтобы гарантированно изолировать _enqueuePos.
+    private readonly long _p8, _p9, _p10, _p11, _p12, _p13, _p14;
+
+    // --- КЭШ-ЛИНИЯ 3: Указатель головы (Использует только Читатель) ---
+    private long _dequeuePos;
+
+    /// <summary>
+    /// Проверяет, закрыта ли очередь и вычитаны ли из неё абсолютно все элементы.
+    /// </summary>
+    public bool IsCompleted => Volatile.Read(ref _dequeuePos) == _buffer.Length;
+
+    public void Enqueue(T item)
+    {
+        var currentTail = _enqueuePos;
+        var currentHead = Volatile.Read(ref _dequeuePos);
+
+        if (currentTail - currentHead >= boundedCapacity)
+        {
+            return;
+        }
+
+        var index = (int)(currentTail % boundedCapacity);
+
+        Volatile.Write(ref _buffer[index], item);
+        Volatile.Write(ref _enqueuePos, currentTail + 1);
+    }
+
+    public bool TryDequeue(out T? item)
+    {
+        var currentHead = _dequeuePos;
+        var currentTail = Volatile.Read(ref _enqueuePos);
+
+        if (currentHead == currentTail)
+        {
+            item = null;
+            return false;
+        }
+
+        var index = (int)(currentHead % boundedCapacity);
+        while (true)
+        {
+            item = Volatile.Read(ref _buffer[index]);
+            if (item != null)
+            {
+                break;
+            }
+        }
+
+        Volatile.Write(ref _buffer[index], null);
+        Volatile.Write(ref _dequeuePos, currentHead + 1);
+        return true;
     }
 }
